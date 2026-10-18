@@ -5,6 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import ClassVar
 
+from carsharing.calculations import (
+    calculate_cancellation_fee,
+    calculate_trip_cost,
+)
+
 
 class Customer:
     def __init__(
@@ -150,22 +155,29 @@ class Booking:
         self.expires_at = expires_at
         self.status = "active"
 
-    def cancel(self) -> float:
+    def cancel(
+        self,
+        now: datetime,
+        free_minutes: int,
+        cancellation_fee: float,
+    ) -> float:
         """Cancels now, returning fee; raises when this booking cannot be cancelled."""
-        if self.status != "active":
+        result = calculate_cancellation_fee(
+            self.created_at,
+            self.expires_at,
+            now,
+            free_minutes,
+            cancellation_fee,
+            self.status == "active",
+        )
+        if result.status == "inactive":
             raise ValueError("Бронь уже не активна")
-        now = datetime.now()
-        if now > self.expires_at:
+        if result.status == "expired":
             self.status = "expired"
             self.car.status = "available"
             raise ValueError("Срок брони истёк")
-
-        elapsed_minutes = (now - self.created_at).total_seconds() / 60
-        from carsharing.config import config
-
-        fee = 0.0
-        if elapsed_minutes > config.cancellation_free_minutes:
-            fee = config.cancellation_fee
+        fee = result.fee
+        if fee > 0:
             self.customer.debit(fee)
         self.status = "cancelled"
         self.car.status = "available"
@@ -203,6 +215,12 @@ class Trip:
         self,
         distance: float,
         idle_minutes: int,
+        finished_at: datetime,
+        demand_coefficient: float,
+        night_start_hour: int,
+        night_end_hour: int,
+        loyalty_discount_per_point: float,
+        maximum_loyalty_discount: float,
         promo_code: str | None = None,
         use_loyalty: bool = False,
     ) -> float:
@@ -212,59 +230,36 @@ class Trip:
         if distance < 0 or idle_minutes < 0:
             raise ValueError("Расстояние и простой не могут быть отрицательными")
 
-        finished_at = datetime.now()
-        minutes = max(1, int((finished_at - self.started_at).total_seconds() // 60))
-        night = finished_at.hour >= 23 or finished_at.hour < 6
-        if night:
-            cost = self.tariff.calc_night_cost(minutes, distance, idle_minutes)
-        else:
-            cost = self.tariff.calc_day_cost(minutes, distance, idle_minutes)
-        cost *= self._demand_coefficient()
-        cost = self._apply_discounts(cost, promo_code, use_loyalty)
-        cost = round(cost, 2)
+        result = calculate_trip_cost(
+            self.tariff,
+            self.started_at,
+            finished_at,
+            distance,
+            idle_minutes,
+            demand_coefficient,
+            promo_code,
+            self.customer.loyalty_points,
+            use_loyalty,
+            night_start_hour,
+            night_end_hour,
+            loyalty_discount_per_point,
+            maximum_loyalty_discount,
+        )
+        cost = result.amount
 
         self.distance = distance
         self.finished_at = finished_at
         self.cost = cost
         self.status = "finished"
+        self.customer.loyalty_points = (
+            result.remaining_points + result.earned_points
+        )
         self.customer.debit(cost)
         self.car.mileage += distance
         self.car.fuel_level = max(0.0, self.car.fuel_level - distance * 0.04)
         self.car.status = "available"
         Trip.total_finished += 1
         print(f"Чек {self.id}: {self.cost:.2f} руб.")
-        return cost
-
-    def _demand_coefficient(self) -> float:
-        import random
-
-        from carsharing.config import config
-
-        return round(
-            random.uniform(config.demand_minimum, config.demand_maximum), 2
-        )
-
-    def _apply_discounts(
-        self, cost: float, promo_code: str | None, use_loyalty: bool
-    ) -> float:
-        if promo_code == "WELCOME10":
-            cost *= 0.9
-        elif promo_code == "NIGHT20" and (
-            self.started_at.hour >= 23 or self.started_at.hour < 6
-        ):
-            cost *= 0.8
-        if use_loyalty:
-            from carsharing.config import config
-
-            discount = min(
-                self.customer.loyalty_points
-                * config.loyalty_discount_per_point,
-                config.maximum_loyalty_discount,
-                cost,
-            )
-            cost -= discount
-            self.customer.loyalty_points -= int(discount)
-        self.customer.loyalty_points += int(cost // 100)
         return cost
 
     def __repr__(self) -> str:

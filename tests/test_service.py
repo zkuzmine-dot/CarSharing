@@ -8,7 +8,14 @@ from datetime import datetime
 import pytest
 from freezegun import freeze_time
 
-from carsharing.models import Trip
+from carsharing.calculations import (
+    apply_loyalty_discount,
+    apply_promo_discount,
+    calculate_cancellation_fee,
+    calculate_fine,
+    calculate_trip_cost as calculate_trip_cost_pure,
+)
+from carsharing.models import Customer, Tariff, Trip
 from carsharing.service import CarsharingService
 
 
@@ -260,3 +267,49 @@ def test_demand_coefficient_is_seeded_for_characterization(
         trip.id, 1, at=datetime(2025, 5, 12, 12, 1)
     )
     assert quote == 18.54
+
+
+def test_pure_cancellation_fee_uses_only_explicit_values() -> None:
+    created_at = datetime(2025, 5, 12, 10, 0)
+    result = calculate_cancellation_fee(
+        created_at,
+        datetime(2025, 5, 12, 10, 15),
+        datetime(2025, 5, 12, 10, 6),
+        free_minutes=5,
+        cancellation_fee=120,
+        is_active=True,
+    )
+    assert (result.status, result.fee) == ("cancelled", 120)
+
+
+def test_pure_trip_cost_and_loyalty_discount_do_not_mutate_customer() -> None:
+    customer = Customer("c1", "Анна", "A123456", 1000, loyalty_points=100)
+    tariff = Tariff("standard", 10, 8, 2, 1.5)
+    result = calculate_trip_cost_pure(
+        tariff,
+        datetime(2025, 5, 12, 22),
+        datetime(2025, 5, 12, 23, 10),
+        3,
+        5,
+        1.0,
+        "WELCOME10",
+        customer.loyalty_points,
+        True,
+        23,
+        6,
+        1.0,
+        500,
+    )
+    assert result.amount == 890.9
+    assert (result.remaining_points, result.earned_points) == (0, 8)
+    assert customer.balance == 1000
+    assert customer.loyalty_points == 100
+    assert apply_loyalty_discount(250, 100, True, 1, 50).amount == 200
+
+
+def test_promo_discount_and_fine_are_pure_calculations() -> None:
+    assert apply_promo_discount(
+        100, "NIGHT20", datetime(2025, 5, 12, 22), 22, 5
+    ) == 80
+    assert calculate_fine(False, 1500) == 1500
+    assert calculate_fine(True, 1500) == 0

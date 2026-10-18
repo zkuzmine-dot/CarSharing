@@ -6,6 +6,11 @@ import math
 import random
 from datetime import datetime, timedelta
 
+from carsharing.calculations import (
+    apply_promo_discount,
+    calculate_fine,
+    calculate_trip_cost,
+)
 from carsharing.config import config
 from carsharing.models import Booking, Car, Customer, Tariff, Trip, Zone
 
@@ -96,7 +101,11 @@ class CarsharingService:
 
     def cancel_booking(self, booking_id: str) -> float:
         booking = self._booking(booking_id)
-        return booking.cancel()
+        return booking.cancel(
+            datetime.now(),
+            config.cancellation_free_minutes,
+            config.cancellation_fee,
+        )
 
     def start_trip(
         self,
@@ -162,28 +171,22 @@ class CarsharingService:
         if distance < 0 or idle_minutes < 0:
             raise ValueError("Расстояние и простой не могут быть отрицательными")
         now = at or datetime.now()
-        minutes = max(1, int((now - trip.started_at).total_seconds() // 60))
-        night = now.hour >= config.night_start_hour or now.hour < config.night_end_hour
-        if night:
-            amount = trip.tariff.calc_night_cost(minutes, distance, idle_minutes)
-        else:
-            amount = trip.tariff.calc_day_cost(minutes, distance, idle_minutes)
-        amount *= self._demand_coefficient()
-        if promo_code == "WELCOME10":
-            amount *= 0.9
-        elif promo_code == "NIGHT20" and (
-            trip.started_at.hour >= config.night_start_hour
-            or trip.started_at.hour < config.night_end_hour
-        ):
-            amount *= 0.8
-        if use_loyalty:
-            discount = min(
-                trip.customer.loyalty_points,
-                config.maximum_loyalty_discount,
-                amount,
-            )
-            amount -= discount
-        return round(amount, 2)
+        result = calculate_trip_cost(
+            trip.tariff,
+            trip.started_at,
+            now,
+            distance,
+            idle_minutes,
+            self._demand_coefficient(),
+            promo_code,
+            trip.customer.loyalty_points,
+            use_loyalty,
+            config.night_start_hour,
+            config.night_end_hour,
+            config.loyalty_discount_per_point,
+            config.maximum_loyalty_discount,
+        )
+        return result.amount
 
     def finish_trip(
         self,
@@ -196,19 +199,36 @@ class CarsharingService:
     ) -> float:
         trip = self._trip(trip_id)
         destination = self._find_zone(parking_point)
-        if destination is None or not destination.allows_parking:
-            trip.customer.debit(config.parking_fine)
+        fine = calculate_fine(
+            destination is not None and destination.allows_parking,
+            config.parking_fine,
+        )
+        if fine > 0:
+            trip.customer.debit(fine)
             trip.car.status = "available"
-            trip.car.zone = destination or trip.car.zone
+            if destination is not None:
+                trip.car.zone = destination
             trip.status = "finished"
             trip.finished_at = datetime.now()
             trip.distance = distance
-            trip.cost = config.parking_fine
-            print(f"Штраф за парковку {trip.id}: {config.parking_fine:.2f} руб.")
+            trip.cost = fine
+            print(f"Штраф за парковку {trip.id}: {fine:.2f} руб.")
             return trip.cost
 
-        cost = trip.finish(distance, idle_minutes, promo_code, use_loyalty)
-        trip.car.zone = destination
+        cost = trip.finish(
+            distance,
+            idle_minutes,
+            datetime.now(),
+            self._demand_coefficient(),
+            config.night_start_hour,
+            config.night_end_hour,
+            config.loyalty_discount_per_point,
+            config.maximum_loyalty_discount,
+            promo_code,
+            use_loyalty,
+        )
+        if destination is not None:
+            trip.car.zone = destination
         return cost
 
     def top_up_balance(self, customer_id: str, amount: float) -> float:
@@ -271,14 +291,16 @@ class CarsharingService:
         if amount < 0:
             raise ValueError("Сумма не может быть отрицательной")
         trip = self._trip(trip_id)
-        if code == "WELCOME10":
-            return round(amount * 0.9, 2)
-        if code == "NIGHT20" and (
-            trip.started_at.hour >= config.night_start_hour
-            or trip.started_at.hour < config.night_end_hour
-        ):
-            return round(amount * 0.8, 2)
-        return round(amount, 2)
+        return round(
+            apply_promo_discount(
+                amount,
+                code,
+                trip.started_at,
+                config.night_start_hour,
+                config.night_end_hour,
+            ),
+            2,
+        )
 
     @staticmethod
     def _distance(first: tuple[float, float], second: tuple[float, float]) -> float:
