@@ -4,22 +4,26 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Callable
 
 from carsharing.calculations import (
-    FarePeriod,
     TripPricing,
-    TripCostCalculation,
     apply_promo_discount,
-    calculate_cancellation_fee,
-    calculate_cost,
-    calculate_fine,
     calculate_trip_cost,
 )
 from carsharing.config import Settings
 from carsharing.models import Booking, Car, Customer, Tariff, Trip, Zone
+from carsharing.transitions import (
+    block_debtors as calculate_debtor_updates,
+    cancel_booking as calculate_booking_cancellation,
+    create_booking as calculate_booking_creation,
+    credit_balance,
+    debit_balance,
+    finish_trip as calculate_trip_finish,
+    start_trip as calculate_trip_start,
+    transfer_car as calculate_car_transfer,
+)
 
 
 class CarsharingService:
@@ -112,50 +116,38 @@ class CarsharingService:
     def create_booking(self, customer_id: str, car_id: str) -> Booking:
         customer = self._customer(customer_id)
         car = self._car(car_id)
-        if customer.status != "active":
-            raise ValueError("Клиент заблокирован")
-        if car.status != "available":
-            raise ValueError("Автомобиль недоступен")
-
-        now = self._clock()
-        booking = Booking(
-            self._next_booking_id(),
-            customer_id,
-            car_id,
-            now,
-            now + timedelta(minutes=self.settings.booking_duration_minutes),
+        result = calculate_booking_creation(
+            customer,
+            car,
+            f"booking-{self._booking_sequence + 1:03d}",
+            self._clock(),
+            self.settings,
         )
-        self.bookings[booking.id] = booking
-        self.customers[customer_id] = replace(
-            customer, bookings=customer.bookings + (booking.id,)
-        )
-        self.cars[car_id] = replace(car, status="booked")
-        return booking
+        if result.error is not None:
+            raise ValueError(result.error)
+        if result.booking is None:
+            raise RuntimeError("Бронь отсутствует в успешном результате")
+        self._booking_sequence += 1
+        self.bookings[result.booking.id] = result.booking
+        self.customers[customer_id] = result.customer
+        self.cars[car_id] = result.car
+        return result.booking
 
     def cancel_booking(self, booking_id: str) -> float:
         booking = self._booking(booking_id)
-        if booking.status != "active":
-            raise ValueError("Бронь уже не активна")
-        now = self._clock()
-        result = calculate_cancellation_fee(
-            booking.created_at,
-            booking.expires_at,
-            now,
-            self.settings.cancellation_free_minutes,
-            self.settings.cancellation_fee,
-            True,
-        )
-        car = self._car(booking.car_id)
-        if result.status == "expired":
-            self.bookings[booking.id] = replace(booking, status="expired")
-            self.cars[car.id] = replace(car, status="available")
-            raise ValueError("Срок брони истёк")
-
         customer = self._customer(booking.customer_id)
-        self.bookings[booking.id] = replace(booking, status="cancelled")
-        self.cars[car.id] = replace(car, status="available")
-        if result.fee > 0:
-            self.customers[customer.id] = self._debit_customer(customer, result.fee)
+        car = self._car(booking.car_id)
+        result = calculate_booking_cancellation(
+            booking, customer, car, self._clock(), self.settings
+        )
+        if result.booking != booking:
+            self.bookings[booking.id] = result.booking
+        if result.car != car:
+            self.cars[car.id] = result.car
+        if result.customer != customer:
+            self.customers[customer.id] = result.customer
+        if result.error is not None:
+            raise ValueError(result.error)
         return result.fee
 
     def start_trip(
@@ -168,47 +160,29 @@ class CarsharingService:
         customer = self._customer(customer_id)
         car = self._car(car_id)
         tariff = self._get_or_create_tariff(tariff_id)
-        self._ensure_active_customer(customer)
-        if customer.balance <= 0:
-            raise ValueError("Недостаточно средств для начала поездки")
-
-        booking: Booking | None = None
-        if booking_id is not None:
-            booking = self._booking(booking_id)
-            if (
-                booking.customer_id != customer.id
-                or booking.car_id != car.id
-                or booking.status != "active"
-            ):
-                raise ValueError("Бронь не соответствует клиенту или машине")
-            if self._clock() > booking.expires_at:
-                self.bookings[booking.id] = replace(booking, status="expired")
-                self.cars[car.id] = replace(car, status="available")
-                raise ValueError("Срок брони истёк")
-            if car.status != "booked":
-                raise ValueError("Автомобиль по брони недоступен")
-            self.bookings[booking.id] = replace(booking, status="used")
-        elif car.status != "available":
-            raise ValueError("Автомобиль недоступен")
-
-        trip = Trip.start(
-            self._next_trip_id(),
-            customer.id,
-            car.id,
-            tariff.id,
+        booking = self._booking(booking_id) if booking_id is not None else None
+        result = calculate_trip_start(
+            customer,
+            car,
+            tariff,
+            f"trip-{self._trip_sequence + 1:03d}",
             self._clock(),
+            booking,
         )
-        self.trips[trip.id] = trip
-        self.customers[customer.id] = replace(
-            customer, trips=customer.trips + (trip.id,)
-        )
-        self.cars[car.id] = replace(
-            car, status="in_use", trips=car.trips + (trip.id,)
-        )
-        self.tariffs[tariff.id] = replace(
-            tariff, trips=tariff.trips + (trip.id,)
-        )
-        return trip
+        if result.booking is not None and result.booking != booking:
+            self.bookings[result.booking.id] = result.booking
+        if result.car != car:
+            self.cars[car.id] = result.car
+        if result.error is not None:
+            raise ValueError(result.error)
+        if result.trip is None:
+            raise RuntimeError("Поездка отсутствует в успешном результате")
+        self._trip_sequence += 1
+        self.trips[result.trip.id] = result.trip
+        self.customers[customer.id] = result.customer
+        self.cars[car.id] = result.car
+        self.tariffs[tariff.id] = result.tariff
+        return result.trip
 
     def calculate_trip_cost(
         self,
@@ -254,115 +228,74 @@ class CarsharingService:
         use_loyalty: bool = False,
     ) -> float:
         trip = self._trip(trip_id)
-        destination = self._find_zone(parking_point)
-        parking_allowed = destination is not None and destination.allows_parking
-        fine = calculate_fine(parking_allowed, self.settings.parking_fine)
         customer = self._customer(trip.customer_id)
         car = self._car(trip.car_id)
-
-        if not parking_allowed:
-            self.customers[customer.id] = self._debit_customer(customer, fine)
-            self.cars[car.id] = replace(
-                car,
-                status="available",
-                zone_id=destination.id if destination is not None else car.zone_id,
-            )
-            self.trips[trip.id] = replace(
-                trip,
-                finished_at=self._clock(),
-                distance=distance,
-                cost=fine,
-                status="finished",
-            )
-            self.total_finished += 1
-            print(f"Штраф за парковку {trip.id}: {fine:.2f} руб.")
-            return fine
-
-        if destination is None:
-            raise RuntimeError("Разрешённая парковка должна принадлежать зоне")
-        if distance < 0 or idle_minutes < 0:
-            raise ValueError("Расстояние и простой не могут быть отрицательными")
         tariff = self._tariff(trip.tariff_id)
-        finished_at = self._clock()
-        calculation = self._calculate_trip_cost(
+        destination = self._find_zone(parking_point)
+        parking_allowed = destination is not None and destination.allows_parking
+        result = calculate_trip_finish(
             trip,
             customer,
+            car,
             tariff,
-            finished_at,
+            destination,
+            self._clock(),
             distance,
             idle_minutes,
+            self._demand_coefficient() if parking_allowed else 1.0,
             promo_code,
             use_loyalty,
+            self.settings,
         )
-        updated_customer = replace(
-            customer,
-            loyalty_points=calculation.remaining_points + calculation.earned_points,
-        )
-        updated_customer = self._debit_customer(updated_customer, calculation.amount)
-        self.customers[customer.id] = updated_customer
-        self.trips[trip.id] = replace(
-            trip,
-            finished_at=finished_at,
-            distance=distance,
-            cost=calculation.amount,
-            status="finished",
-        )
-        self.cars[car.id] = replace(
-            car,
-            status="available",
-            zone_id=destination.id,
-            mileage=car.mileage + distance,
-            fuel_level=max(0.0, car.fuel_level - distance * 0.04),
-        )
+        if result.error is not None:
+            raise ValueError(result.error)
+        self.trips[trip.id] = result.trip
+        self.customers[customer.id] = result.customer
+        self.cars[car.id] = result.car
         self.total_finished += 1
-        print(f"Чек {trip.id}: {calculation.amount:.2f} руб.")
-        return calculation.amount
+        print(result.receipt)
+        return result.amount
 
     def top_up_balance(self, customer_id: str, amount: float) -> float:
-        if amount <= 0:
-            raise ValueError("Пополнение должно быть положительным")
         customer = self._customer(customer_id)
-        balance = customer.balance + amount
-        status = (
-            "active"
-            if customer.status == "blocked" and balance >= 0
-            else customer.status
-        )
-        self.customers[customer_id] = replace(
-            customer, balance=balance, status=status
-        )
-        return balance
+        result = credit_balance(customer, amount)
+        if result.error is not None:
+            raise ValueError(result.error)
+        self.customers[customer_id] = result.customer
+        return result.customer.balance
 
     def charge_balance(self, customer_id: str, amount: float) -> float:
         customer = self._customer(customer_id)
-        updated = self._debit_customer(customer, amount)
-        self.customers[customer_id] = updated
-        return updated.balance
+        result = debit_balance(customer, amount)
+        if result.error is not None:
+            raise ValueError(result.error)
+        self.customers[customer_id] = result.customer
+        return result.customer.balance
 
     def block_debtors(self, minimum_balance: float = 0.0) -> tuple[Customer, ...]:
         if minimum_balance < 0:
             raise ValueError("Порог долга не может быть отрицательным")
+        before = tuple(self.customers.values())
+        after = calculate_debtor_updates(before, minimum_balance)
         blocked: list[Customer] = []
-        for customer in tuple(self.customers.values()):
-            if customer.balance < minimum_balance:
-                updated = replace(customer, status="blocked")
-                self.customers[customer.id] = updated
+        for original, updated in zip(before, after):
+            if original.balance < minimum_balance:
                 blocked.append(updated)
+                if updated != original:
+                    self.customers[updated.id] = updated
         return tuple(blocked)
 
     def transfer_car(self, car_id: str, zone_id: str) -> Car:
         car = self._car(car_id)
         zone = self._zone(zone_id)
-        if car.status != "available":
-            raise ValueError("Перегонять можно только свободный автомобиль")
         old_zone = self._zone(car.zone_id)
-        self.zones[old_zone.id] = replace(
-            old_zone, cars=tuple(item for item in old_zone.cars if item != car.id)
-        )
-        self.zones[zone.id] = replace(zone, cars=zone.cars + (car.id,))
-        transferred = replace(car, zone_id=zone.id)
-        self.cars[car.id] = transferred
-        return transferred
+        result = calculate_car_transfer(car, old_zone, zone)
+        if result.error is not None:
+            raise ValueError(result.error)
+        self.cars[car.id] = result.car
+        self.zones[old_zone.id] = result.old_zone
+        self.zones[zone.id] = result.new_zone
+        return result.car
 
     def monthly_statement(
         self, customer_id: str, year: int, month: int
@@ -403,45 +336,6 @@ class CarsharingService:
                 self.settings.night_end_hour,
             ),
             2,
-        )
-
-    def _calculate_trip_cost(
-        self,
-        trip: Trip,
-        customer: Customer,
-        tariff: Tariff,
-        finished_at: datetime,
-        distance: float,
-        idle_minutes: int,
-        promo_code: str | None,
-        use_loyalty: bool,
-    ) -> TripCostCalculation:
-        return calculate_trip_cost(
-            tariff,
-            TripPricing(
-                trip.started_at,
-                finished_at,
-                distance,
-                idle_minutes,
-                self._demand_coefficient(),
-                promo_code,
-                customer.loyalty_points,
-                use_loyalty,
-            ),
-            self.settings.night_start_hour,
-            self.settings.night_end_hour,
-            self.settings.loyalty_discount_per_point,
-            self.settings.maximum_loyalty_discount,
-        )
-
-    def _debit_customer(self, customer: Customer, amount: float) -> Customer:
-        if amount <= 0:
-            raise ValueError("Списание должно быть положительным")
-        balance = customer.balance - amount
-        return replace(
-            customer,
-            balance=balance,
-            status="blocked" if balance < 0 else customer.status,
         )
 
     def _get_or_create_tariff(self, tariff_id: str) -> Tariff:
@@ -504,16 +398,3 @@ class CarsharingService:
             return self.zones[zone_id]
         except KeyError as error:
             raise ValueError(f"Зона {zone_id!r} не найдена") from error
-
-    @staticmethod
-    def _ensure_active_customer(customer: Customer) -> None:
-        if customer.status != "active":
-            raise ValueError("Клиент заблокирован")
-
-    def _next_booking_id(self) -> str:
-        self._booking_sequence += 1
-        return f"booking-{self._booking_sequence:03d}"
-
-    def _next_trip_id(self) -> str:
-        self._trip_sequence += 1
-        return f"trip-{self._trip_sequence:03d}"
