@@ -3,25 +3,23 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 from datetime import datetime
-from unittest.mock import patch
 
 from carsharing.service import CarsharingService
 
 
-class DemoDateTime(datetime):
-    @classmethod
-    def now(cls, tz=None) -> DemoDateTime:
-        return cls(2025, 5, 12, 12, 0, 0)
-
-
 def _run_scenario() -> None:
-    service = CarsharingService()
+    service = CarsharingService(
+        clock=lambda: datetime(2025, 5, 12, 12, 0, 0),
+        rng=random.Random(7),
+    )
 
     customer = service.register_customer(
         "customer-1", "Анна Иванова", "77АА123456", balance=5000
     )
-    customer.loyalty_points = 50
+    customer = replace(customer, loyalty_points=50)
+    service.customers[customer.id] = customer
     print(f"Регистрация: {customer.name}, права проверены")
 
     nearest = service.find_nearest_cars((1.0, 1.0), limit=2)
@@ -36,7 +34,10 @@ def _run_scenario() -> None:
 
     second_booking = service.create_booking(customer.id, "car-1")
     trip = service.start_trip(customer.id, "car-1", booking_id=second_booking.id)
-    print(f"Начало поездки {trip.id}: {trip.car.model}, тариф {trip.tariff.id}")
+    print(
+        f"Начало поездки {trip.id}: {service.cars[trip.car_id].model}, "
+        f"тариф {service.tariffs[trip.tariff_id].id}"
+    )
 
     quote = service.calculate_trip_cost(
         trip.id,
@@ -67,6 +68,7 @@ def _run_scenario() -> None:
     print(f"Пополнение: баланс {balance:.2f} руб.")
     balance = service.charge_balance(customer.id, 100)
     print(f"Списание: баланс {balance:.2f} руб.")
+    customer = service.customers[customer.id]
 
     debtor = service.register_customer(
         "customer-2", "Борис Петров", "77ББ654321", balance=10
@@ -76,10 +78,14 @@ def _run_scenario() -> None:
         customer.name for customer in service.block_debtors()
     ))
     service.top_up_balance(debtor.id, 50)
+    debtor = service.customers[debtor.id]
     print(f"После погашения долга: {debtor.status}, баланс {debtor.balance:.2f}")
 
     transferred = service.transfer_car("car-2", "center")
-    print(f"Перегон: {transferred.model} теперь в зоне {transferred.zone.name}")
+    print(
+        f"Перегон: {transferred.model} теперь в зоне "
+        f"{service.zones[transferred.zone_id].name}"
+    )
     statement = service.monthly_statement(customer.id, 2025, 5)
     print(
         f"Выписка {statement['period']}: поездок {statement['trip_count']}, "
@@ -88,12 +94,7 @@ def _run_scenario() -> None:
 
 
 def main() -> None:
-    random.seed(7)
-    with (
-        patch("carsharing.models.datetime", DemoDateTime),
-        patch("carsharing.service.datetime", DemoDateTime),
-    ):
-        _run_scenario()
+    _run_scenario()
 
 
 if __name__ == "__main__":

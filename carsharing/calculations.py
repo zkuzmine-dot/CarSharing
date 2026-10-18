@@ -1,13 +1,17 @@
-"""Pure business calculations with time, policy, and model data passed explicitly."""
+"""Pure business calculations with dependencies supplied explicitly."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from enum import Enum
 
-if TYPE_CHECKING:
-    from carsharing.models import Tariff
+from carsharing.models import Tariff
+
+
+class FarePeriod(Enum):
+    DAY = "day"
+    NIGHT = "night"
 
 
 @dataclass(frozen=True)
@@ -24,10 +28,38 @@ class LoyaltyCalculation:
 
 
 @dataclass(frozen=True)
+class TripPricing:
+    started_at: datetime
+    finished_at: datetime
+    distance: float
+    idle_minutes: int
+    demand_coefficient: float
+    promo_code: str | None
+    loyalty_points: int
+    use_loyalty: bool
+
+
+@dataclass(frozen=True)
 class TripCostCalculation:
     amount: float
     remaining_points: int
     earned_points: int
+
+
+def calculate_cost(
+    tariff: Tariff,
+    period: FarePeriod,
+    minutes: int,
+    distance: float,
+    idle_minutes: int,
+) -> float:
+    """Calculate a fare for day or night using one shared formula."""
+    coefficient = (
+        tariff.night_coefficient if period is FarePeriod.NIGHT else 1.0
+    )
+    driving = (minutes * tariff.per_minute + distance * tariff.per_km) * coefficient
+    parking = idle_minutes * tariff.parking_per_minute * coefficient
+    return round(driving + parking, 2)
 
 
 def calculate_cancellation_fee(
@@ -38,7 +70,7 @@ def calculate_cancellation_fee(
     cancellation_fee: float,
     is_active: bool,
 ) -> CancellationCalculation:
-    """Describe a cancellation outcome without reading clocks or changing objects."""
+    """Describe the cancellation outcome without mutation or clock access."""
     if not is_active:
         return CancellationCalculation("inactive", 0.0)
     if now > expires_at:
@@ -55,7 +87,7 @@ def apply_loyalty_discount(
     discount_per_point: float,
     maximum_discount: float,
 ) -> LoyaltyCalculation:
-    """Calculate discounted amount and point balance without mutating a customer."""
+    """Calculate discounted amount and resulting points without mutation."""
     remaining_points = loyalty_points
     if use_loyalty:
         discount = min(
@@ -65,8 +97,7 @@ def apply_loyalty_discount(
         )
         amount -= discount
         remaining_points -= int(discount)
-    earned_points = int(amount // 100)
-    return LoyaltyCalculation(amount, remaining_points, earned_points)
+    return LoyaltyCalculation(amount, remaining_points, int(amount // 100))
 
 
 def apply_promo_discount(
@@ -76,7 +107,7 @@ def apply_promo_discount(
     night_start_hour: int,
     night_end_hour: int,
 ) -> float:
-    """Apply a supported promo code using explicit night-hour boundaries."""
+    """Apply a promotional code using explicit night-hour boundaries."""
     if promo_code == "WELCOME10":
         return amount * 0.9
     if promo_code == "NIGHT20" and (
@@ -88,36 +119,37 @@ def apply_promo_discount(
 
 def calculate_trip_cost(
     tariff: Tariff,
-    started_at: datetime,
-    finished_at: datetime,
-    distance: float,
-    idle_minutes: int,
-    demand_coefficient: float,
-    promo_code: str | None,
-    loyalty_points: int,
-    use_loyalty: bool,
+    pricing: TripPricing,
     night_start_hour: int,
     night_end_hour: int,
     loyalty_discount_per_point: float,
     maximum_loyalty_discount: float,
 ) -> TripCostCalculation:
-    """Calculate a complete trip charge from explicit inputs only."""
-    minutes = max(1, int((finished_at - started_at).total_seconds() // 60))
-    night = (
-        finished_at.hour >= night_start_hour or finished_at.hour < night_end_hour
+    """Calculate a complete trip cost from explicit immutable values."""
+    minutes = max(
+        1, int((pricing.finished_at - pricing.started_at).total_seconds() // 60)
     )
-    if night:
-        amount = tariff.calc_night_cost(minutes, distance, idle_minutes)
-    else:
-        amount = tariff.calc_day_cost(minutes, distance, idle_minutes)
-    amount *= demand_coefficient
+    period = (
+        FarePeriod.NIGHT
+        if pricing.finished_at.hour >= night_start_hour
+        or pricing.finished_at.hour < night_end_hour
+        else FarePeriod.DAY
+    )
+    amount = calculate_cost(
+        tariff, period, minutes, pricing.distance, pricing.idle_minutes
+    )
+    amount *= pricing.demand_coefficient
     amount = apply_promo_discount(
-        amount, promo_code, started_at, night_start_hour, night_end_hour
+        amount,
+        pricing.promo_code,
+        pricing.started_at,
+        night_start_hour,
+        night_end_hour,
     )
     loyalty = apply_loyalty_discount(
         amount,
-        loyalty_points,
-        use_loyalty,
+        pricing.loyalty_points,
+        pricing.use_loyalty,
         loyalty_discount_per_point,
         maximum_loyalty_discount,
     )
@@ -129,5 +161,5 @@ def calculate_trip_cost(
 
 
 def calculate_fine(is_parking_allowed: bool, fine_amount: float) -> float:
-    """Calculate a parking fine without changing the trip or customer."""
+    """Calculate a parking fine without mutating trip or customer."""
     return 0.0 if is_parking_allowed else fine_amount
